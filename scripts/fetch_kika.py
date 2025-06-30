@@ -1,17 +1,39 @@
 #!/usr/bin/env python3
-import datetime, os, re, requests, io, sys, json
+import datetime
+import os
+import re
+import requests
+import io
+import sys
+import json
 import pandas as pd
 from pdfminer.high_level import extract_text
+from bs4 import BeautifulSoup
 import boto3
 
 KANPOU_BASE = "https://kanpou.npb.go.jp"
 
-def list_today_pdfs(date):
-    # 本紙・号外の URL パターン例（号外は適宜追加）
+def find_kika_pdf(date):
+    """Return the PDF url when the naturalization notice appears in today's table of contents."""
     ymd = date.strftime("%Y%m%d")
-    return [
-        f"{KANPOU_BASE}/{ymd}/{ymd}g00001/{ymd}g000010000.pdf",   # 本紙全ページ
-    ]
+    index_url = f"{KANPOU_BASE}/{ymd}/index.html"
+    try:
+        html = requests.get(index_url, timeout=20, headers={"User-Agent": "MUTSUMI-bot/1.0"}).text
+    except Exception as e:
+        print(f"failed to fetch {index_url}: {e}", file=sys.stderr)
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    h2 = soup.find("h2", string=lambda t: t and "官庁報告" in t)
+    if not h2:
+        return None
+    for el in h2.find_all_next():
+        if el.name == "h2":
+            break
+        if el.name == "a" and el.get_text(strip=True).startswith("日本国に帰化を許可する件"):
+            href = el.get("href")
+            if href and href.endswith(".pdf"):
+                return f"{KANPOU_BASE}/{ymd}/{href}"
+    return None
 
 def download(url):
     r = requests.get(url, timeout=30, headers={'User-Agent':'MUTSUMI-bot/1.0'})
@@ -37,20 +59,28 @@ def save_s3(bucket, key, body, content_type):
 def main():
     date = datetime.date.today()
     bucket = os.getenv("S3_BUCKET")
-    all_rows=[]
-    for url in list_today_pdfs(date):
-        try:
-            pdf = download(url)
-        except Exception as e:
-            print(f"skip {url}: {e}", file=sys.stderr); continue
-        # 保存
-        rel = f"raw/{date}/{os.path.basename(url)}"
-        os.makedirs(os.path.dirname(rel), exist_ok=True)
-        with open(rel,"wb") as f: f.write(pdf)
-        if bucket: save_s3(bucket, rel, pdf, "application/pdf")
-        # 抽出
-        rows = extract_kika_records(pdf)
-        all_rows.extend(rows)
+    all_rows = []
+
+    url = find_kika_pdf(date)
+    if not url:
+        print("no naturalization notice today")
+        return
+
+    try:
+        pdf = download(url)
+    except Exception as e:
+        print(f"skip {url}: {e}", file=sys.stderr)
+        return
+
+    rel = f"raw/{date}/{os.path.basename(url)}"
+    os.makedirs(os.path.dirname(rel), exist_ok=True)
+    with open(rel, "wb") as f:
+        f.write(pdf)
+    if bucket:
+        save_s3(bucket, rel, pdf, "application/pdf")
+
+    rows = extract_kika_records(pdf)
+    all_rows.extend(rows)
 
     if all_rows:
         df = pd.DataFrame(all_rows)
